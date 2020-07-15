@@ -1,0 +1,326 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2020 Samsung Electronics Co., Ltd. All Rights Reserved.
+#
+# Written by Klaus Jensen <k.jensen@samsung.com>
+
+set -euo pipefail
+
+# do not echo control characters
+stty -echoctl
+
+# script basename/basedir
+BASENAME="$(basename "$BASH_SOURCE")"
+BASEDIR="$(dirname $(readlink -f "$BASH_SOURCE"))"
+
+VERSION="v0.99"
+
+# defaults
+: "${IMAGE_NAME:="archbase.qcow2"}"
+: "${MIRROR:="https://mirrors.kernel.org/archlinux"}"
+: "${IMAGE_SIZE:="8G"}"
+: "${PACKAGES:=""}"
+: "${LOGFILE:="log/archbase.log"}"
+
+USAGE="usage: ${BASENAME} -k FILE [OPTION...]
+
+Build an Arch Linux qcow2 base image.
+
+Optional options:
+  -h, --help                  show this usage message
+  -c, --config CONFIG         configuration file to use
+  -o, --output NAME           output image name (default: \"$IMAGE_NAME\")
+  -s, --size SIZE             qcow2 image size (default: \"$IMAGE_SIZE\")
+  -p, --packages PKG,...      comma-separated list of additional packages to install
+  -m, --mirror URL            mirror base url to use (default: \"$MIRROR\")"
+
+_prefix() {
+  awk "{
+    print \"$1 \" \$0
+  }"
+}
+
+_prefix_err() {
+  _prefix "\x1b[1;31m>>\x1b[0m"
+}
+
+_prefix_ok() {
+  _prefix "\x1b[1;32m>>\x1b[0m"
+}
+
+_prefix_info() {
+  _prefix "\x1b[1m>>\x1b[0m"
+}
+
+_log_frame() {
+  local sev="$1"
+  local frame="$2"
+
+  shift 2
+
+  local _IFS="$IFS"
+  IFS=$' '
+
+  case "$sev" in
+    fatal | debug )
+      echo "(${FUNCNAME[$frame]}; ${BASH_SOURCE[$frame]}:${BASH_LINENO[(($frame-1))]}): $*" | _prefix_err >&2
+      ;;
+    err | error )
+      echo "$*" | _prefix_err >&2
+      ;;
+    ok | success )
+      echo "$*" | _prefix_ok
+      ;;
+    * )
+      echo "$*" | _prefix_info
+      ;;
+  esac
+
+  IFS="$_IFS"
+}
+
+_log() {
+  _log_frame info 2 "$@"
+}
+
+_success() {
+  _log_frame success 2 "$@"
+}
+
+_error() {
+  _log_frame err 2 "$@"
+}
+
+_fatal() {
+  local rc="$1"; shift
+  _log_frame debug 2 "$*:"
+  awk "{
+    if (NR > 10) {
+      print \"    ...\"
+      print \"    (See '$LOGFILE' for full error message)\"
+      exit
+    }
+    print \"    \" \$0
+  }" "$LOGFILE" | _prefix_err
+
+  exit "$rc"
+}
+
+_usage() {
+  if [[ $2 -ne 0 ]]; then
+    >&2 echo "$1"
+    exit "$2"
+  fi
+
+  echo "$1"
+  exit 0
+}
+
+_require_program() {
+  if ! command -v "$1" >/dev/null; then
+    _fatal 1 "'$1' is not available"
+  fi
+
+  return 0
+}
+
+_find_unused_nbd() {
+  for dev in /sys/block/nbd{0..15}; do
+    if [[ "$(<"${dev}/size")" -eq 0 ]]; then
+      echo "/dev/$(basename "$dev")"
+      return
+    fi
+  done
+
+  _fatal 1 "could not find an unused nbd device"
+}
+
+_interrupt() {
+  _error "interrupted"
+  trap - INT
+
+  # From https://mywiki.wooledge.org/SignalTrap
+  #
+  #   "... a process that exits in response to SIGINT should kill itself with
+  #   SIGINT rather than simply exiting, to avoid causing problems for its
+  #   caller."
+  kill -s INT "$$"
+}
+
+_cleanup() {
+  _log "cleaning up"
+
+  if [[ -v MOUNTPOINT ]]; then
+    _log "unmounting ${TARGET_DEV}p1 (be patient)"
+    if ! _ umount "$MOUNTPOINT"; then
+      _fatal "$_rc" "could not unmount $TARGET_DEV"
+    fi
+  fi
+
+  if [[ -v TARGET_DEV ]]; then
+    _log "disconnecting $IMAGE_NAME from $TARGET_DEV"
+    if ! _ qemu-nbd -d "$TARGET_DEV"; then
+      _fatal "$_rc" "could not disconnect $IMAGE_NAME from $TARGET_DEV"
+    fi
+  fi
+}
+
+_() {
+  "$@" > >(_prefix "   $1: ") 2>>"$LOGFILE"; _rc="$?"; return "$_rc"
+}
+
+_duration() {
+  local -i seconds minutes
+
+  seconds="$1"
+  minutes=$(( seconds / 60 ))
+  seconds=$(( seconds - minutes * 60 ))
+
+  printf "%dm%ds" "$minutes" "$seconds"
+}
+
+_main() {
+  local -i ts_begin ts_end
+
+  local short="o:,k:,m:,s:,p:,c:,t:h"
+  local long="output:,mirror:,size:,packages:,config:,version,help"
+
+  if ! tmp=$(getopt -o "${short}" --long "$long" -n "${BASH_SOURCE[0]}" -- "$@"); then
+    exit 1
+  fi
+
+  eval set -- "$tmp"
+  unset tmp
+
+  while true; do
+    case "$1" in
+      '-c' | '--config' )
+        if [[ ! -r "$2" ]]; then
+          _error "cannot read configuration file"
+          exit 1
+        fi
+
+        CONFIG="$2"; shift 2
+        readonly CONFIG
+        ;;
+
+      '-o' | '--output' )
+        IMAGE_NAME="$2"; shift 2
+        readonly IMAGE_NAME
+        ;;
+
+      '-p' | '--packages' )
+        PACKAGES="$2"; shift 2
+        readonly PACKAGES
+        ;;
+
+      '-m' | '--mirror' )
+        MIRROR="$2"; shift 2
+        readonly MIRROR
+        ;;
+
+      '-s' | '--size' )
+        IMAGE_SIZE="$2"; shift 2
+        readonly IMAGE_SIZE
+        ;;
+
+      '--version' )
+        echo "archbase $VERSION"
+        exit 0
+        ;;
+
+      '-h' | '--help' )
+        _usage "$USAGE" 0
+        ;;
+
+      '--' )
+        shift; break
+        ;;
+
+      * )
+        exit 1
+        ;;
+    esac
+  done
+
+  # check that we are privileged
+  if [[ $EUID -ne 0 ]]; then
+    _error "this script must be executed as root"
+    exit 1
+  fi
+
+  : >"$LOGFILE"
+
+  if [[ -v CONFIG ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG"
+  fi
+
+  _log "building image (output: $IMAGE_NAME; size: $IMAGE_SIZE)"
+  _log "mirror: $MIRROR"
+
+  if ! ls /dev/nbd* >/dev/null 2>&1 && ! modprobe nbd; then
+    _error "1" "could not load nbd kernel module"
+    exit 1
+  fi
+
+  ts_begin=$(date +%s)
+
+  _log "creating qcow2 image"
+  if ! _ qemu-img create -f qcow2 "$IMAGE_NAME" "$IMAGE_SIZE"; then
+    _fatal "$_rc" "could not create qcow2 image"
+  fi
+
+  TARGET_DEV="$(_find_unused_nbd)"
+
+  trap _cleanup EXIT
+
+
+  _log "connecting $IMAGE_NAME to $TARGET_DEV"
+  if ! _ qemu-nbd -c "$TARGET_DEV" "$IMAGE_NAME"; then
+    _fatal "$_rc" "could not connect $IMAGE_NAME to $TARGET_DEV"
+  fi
+
+  _log "partitioning $TARGET_DEV"
+  if ! _ sfdisk "$TARGET_DEV" <<< ";"; then
+    _fatal "$_rc" "could not partition $TARGET_DEV"
+  fi
+
+  _log "formatting ${TARGET_DEV}p1 with ext4"
+  if ! _ mkfs.ext4 -L rootfs "${TARGET_DEV}p1"; then
+    _fatal "$_rc" "could not create ext4 file system on $TARGET_DEV"
+  fi
+
+  MOUNTPOINT="${BASEDIR}/_builddir"
+  mkdir -p "$MOUNTPOINT"
+  _log "mounting ${TARGET_DEV}p1 on $MOUNTPOINT"
+  if ! _ mount "${TARGET_DEV}p1" "$MOUNTPOINT"; then
+    _fatal "$_rc" "could not mount ${TARGET_DEV}p1"
+  fi
+
+  _log "building 'builder' docker image"
+  if ! img_hash=$(docker build -q --build-arg mirror="$MIRROR" "${BASEDIR}/builder"); then
+    _fatal "$_rc" "could not build 'builder' docker image"
+  fi
+
+  _log "installing archlinux on image"
+  if ! _ docker run -it --rm \
+    --mount "type=bind,src=${BASEDIR}/_builddir,dst=/install" \
+    --privileged "$img_hash" build \
+      --target-dev "$TARGET_DEV" \
+      --extra-packages "$PACKAGES"; then
+    _fatal "$_rc" "unexpected builder exit"
+  fi
+
+  ts_end=$(date +%s)
+
+  _success "image \"${IMAGE_NAME}\" successfully built in $(_duration $((ts_end - ts_begin)))"
+}
+
+for prog in docker qemu-img qemu-nbd sfdisk mkfs.ext4; do
+  _require_program "$prog"
+done
+
+trap _interrupt INT
+
+_main "$@"
